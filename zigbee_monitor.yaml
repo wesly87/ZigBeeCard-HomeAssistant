@@ -1,0 +1,274 @@
+###############################################################################
+#  ZIGBEE MONITOR - package per Home Assistant
+#  - censisce tutti i dispositivi Zigbee (ZHA e/o Zigbee2MQTT)
+#  - avvisa quando un dispositivo si scollega / torna online
+#  - avvisa quando una batteria scende sotto la soglia impostata
+#
+#  👉 L'UNICA cosa da personalizzare è il servizio di notifica nello script
+#     "zigbee_notifica" (in fondo al file): cerca "notify.notify".
+###############################################################################
+
+input_number:
+  zigbee_soglia_batteria:
+    name: Soglia batteria Zigbee
+    icon: mdi:battery-alert-variant-outline
+    min: 5
+    max: 50
+    step: 5
+    mode: slider
+    unit_of_measurement: "%"
+
+template:
+  # Ora di avvio di HA: serve a non mandare falsi allarmi nei primi minuti
+  # dopo un riavvio, quando molti dispositivi risultano ancora "unavailable".
+  - triggers:
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: Zigbee monitor avvio
+        unique_id: zigbee_monitor_avvio
+        icon: mdi:restart
+        device_class: timestamp
+        state: "{{ now().isoformat() }}"
+
+  # Censimento completo, ricalcolato ogni minuto
+  - triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+      - trigger: event
+        event_type: event_template_reloaded
+    sensor:
+      - name: Zigbee dispositivi
+        unique_id: zigbee_monitor_dispositivi
+        icon: mdi:zigbee
+        unit_of_measurement: dispositivi
+        state: >
+          {% from 'zigbee_monitor.jinja' import zigbee_report %}
+          {{ zigbee_report() | from_json | count }}
+        attributes:
+          elenco: >
+            {% from 'zigbee_monitor.jinja' import zigbee_report %}
+            {{ zigbee_report() | from_json }}
+
+  # Sensori derivati (si aggiornano quando cambia il censimento)
+  - sensor:
+      - name: Zigbee dispositivi offline
+        unique_id: zigbee_monitor_offline
+        unit_of_measurement: dispositivi
+        icon: >
+          {{ 'mdi:lan-disconnect' if (state_attr('sensor.zigbee_dispositivi', 'elenco') or [])
+             | rejectattr('online') | list | count > 0 else 'mdi:lan-connect' }}
+        state: >
+          {{ (state_attr('sensor.zigbee_dispositivi', 'elenco') or [])
+             | rejectattr('online') | list | count }}
+        attributes:
+          dispositivi: >
+            {{ (state_attr('sensor.zigbee_dispositivi', 'elenco') or [])
+               | rejectattr('online') | list }}
+
+      - name: Zigbee batterie basse
+        unique_id: zigbee_monitor_batterie_basse
+        unit_of_measurement: dispositivi
+        icon: mdi:battery-alert
+        state: >
+          {% set soglia = states('input_number.zigbee_soglia_batteria') | float(20) %}
+          {% set ns = namespace(n=0) %}
+          {% for d in state_attr('sensor.zigbee_dispositivi', 'elenco') or [] %}
+            {% if d.batteria_bassa or (d.batteria is not none and d.batteria <= soglia) %}
+              {% set ns.n = ns.n + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.n }}
+        attributes:
+          dispositivi: >
+            {% set soglia = states('input_number.zigbee_soglia_batteria') | float(20) %}
+            {% set ns = namespace(l=[]) %}
+            {% for d in state_attr('sensor.zigbee_dispositivi', 'elenco') or [] %}
+              {% if d.batteria_bassa or (d.batteria is not none and d.batteria <= soglia) %}
+                {% set ns.l = ns.l + [d] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.l }}
+
+      - name: Zigbee batteria minima
+        unique_id: zigbee_monitor_batteria_minima
+        device_class: battery
+        unit_of_measurement: "%"
+        availability: >
+          {{ (state_attr('sensor.zigbee_dispositivi', 'elenco') or [])
+             | rejectattr('batteria', 'none') | list | count > 0 }}
+        state: >
+          {{ (state_attr('sensor.zigbee_dispositivi', 'elenco') or [])
+             | rejectattr('batteria', 'none') | map(attribute='batteria') | min | round(0) | int }}
+        attributes:
+          dispositivo: >
+            {% set l = (state_attr('sensor.zigbee_dispositivi', 'elenco') or [])
+               | rejectattr('batteria', 'none') | sort(attribute='batteria') | list %}
+            {{ l[0].nome if l else '' }}
+
+script:
+  zigbee_notifica:
+    alias: "Zigbee - Invia notifica"
+    icon: mdi:message-alert-outline
+    mode: queued
+    fields:
+      titolo:
+        description: Titolo della notifica
+        example: "Zigbee"
+      messaggio:
+        description: Testo della notifica
+        example: "Sensore porta offline"
+      id_notifica:
+        description: ID della notifica persistente (stesso ID = sovrascrive)
+        example: "zigbee_offline"
+    sequence:
+      # Notifica nella campanella di Home Assistant
+      - action: persistent_notification.create
+        data:
+          title: "{{ titolo }}"
+          message: "{{ messaggio }}"
+          notification_id: "{{ id_notifica | default('zigbee_monitor') }}"
+      # Notifica push sul telefono
+      - action: notify.send_message
+        continue_on_error: true
+        target:
+          entity_id: notify.oppo_cloud
+        data:
+          title: "{{ titolo }}"
+          message: "{{ messaggio }}"
+
+automation:
+  #############################################################################
+  # Dispositivi scollegati / non più disponibili
+  #############################################################################
+  - id: zigbee_monitor_offline
+    alias: "Zigbee - Avviso dispositivi offline"
+    description: Avvisa quando un dispositivo Zigbee si scollega o torna online
+    mode: queued
+    max: 20
+    triggers:
+      - trigger: state
+        entity_id: sensor.zigbee_dispositivi_offline
+        attribute: dispositivi
+        id: cambio
+      - trigger: homeassistant
+        event: start
+        id: avvio
+    actions:
+      - choose:
+          # 10 minuti dopo il riavvio: riepilogo di chi è ancora offline
+          - conditions: "{{ trigger.id == 'avvio' }}"
+            sequence:
+              - delay: "00:10:00"
+              - condition: numeric_state
+                entity_id: sensor.zigbee_dispositivi_offline
+                above: 0
+              - action: script.zigbee_notifica
+                data:
+                  id_notifica: zigbee_offline
+                  titolo: "⚠️ Zigbee: dispositivi offline dopo il riavvio"
+                  messaggio: >-
+                    {% for d in state_attr('sensor.zigbee_dispositivi_offline', 'dispositivi') or [] -%}
+                    🔴 {{ d.nome }}{{ ' (' ~ d.area ~ ')' if d.area != '-' }}{{ '\n' if not loop.last }}
+                    {%- endfor %}
+
+          # Variazione durante il normale funzionamento
+          - conditions:
+              - "{{ trigger.id == 'cambio' }}"
+              # niente avvisi nei primi 5 minuti dopo l'avvio di HA
+              - >
+                {{ (states('sensor.zigbee_monitor_avvio') | as_datetime(now()))
+                   < now() - timedelta(minutes=5) }}
+            sequence:
+              - variables:
+                  prima: >
+                    {{ (trigger.from_state.attributes.dispositivi | default([]))
+                       if trigger.from_state else [] }}
+                  dopo: "{{ trigger.to_state.attributes.dispositivi | default([]) }}"
+                  nuovi: "{{ dopo | rejectattr('id', 'in', prima | map(attribute='id') | list) | list }}"
+                  tornati: "{{ prima | rejectattr('id', 'in', dopo | map(attribute='id') | list) | list }}"
+              - if: "{{ nuovi | count > 0 }}"
+                then:
+                  - action: script.zigbee_notifica
+                    data:
+                      id_notifica: zigbee_offline
+                      titolo: "⚠️ Zigbee: dispositivo non raggiungibile"
+                      messaggio: >-
+                        {% for d in nuovi -%}
+                        🔴 {{ d.nome }}{{ ' (' ~ d.area ~ ')' if d.area != '-' }}{{ '\n' if not loop.last }}
+                        {%- endfor %}{{ '\n' }}Totale offline: {{ dopo | count }}
+              - if: "{{ tornati | count > 0 }}"
+                then:
+                  - action: script.zigbee_notifica
+                    data:
+                      id_notifica: zigbee_online
+                      titolo: "✅ Zigbee: dispositivo di nuovo online"
+                      messaggio: >-
+                        {% for d in tornati -%}
+                        🟢 {{ d.nome }}{{ ' (' ~ d.area ~ ')' if d.area != '-' }}{{ '\n' if not loop.last }}
+                        {%- endfor %}
+              # tutto a posto: rimuovo l'avviso dalla campanella
+              - if: "{{ dopo | count == 0 }}"
+                then:
+                  - action: persistent_notification.dismiss
+                    data:
+                      notification_id: zigbee_offline
+
+  #############################################################################
+  # Batterie in esaurimento
+  #############################################################################
+  - id: zigbee_monitor_batterie
+    alias: "Zigbee - Avviso batterie scariche"
+    description: Avvisa quando la batteria di un dispositivo Zigbee scende sotto soglia
+    mode: queued
+    max: 20
+    triggers:
+      - trigger: state
+        entity_id: sensor.zigbee_batterie_basse
+        attribute: dispositivi
+        id: cambio
+      # promemoria giornaliero finché le batterie non vengono cambiate
+      - trigger: time
+        at: "19:00:00"
+        id: promemoria
+    actions:
+      - choose:
+          - conditions:
+              - "{{ trigger.id == 'cambio' }}"
+              - >
+                {{ (states('sensor.zigbee_monitor_avvio') | as_datetime(now()))
+                   < now() - timedelta(minutes=5) }}
+            sequence:
+              - variables:
+                  prima: >
+                    {{ (trigger.from_state.attributes.dispositivi | default([]))
+                       if trigger.from_state else [] }}
+                  dopo: "{{ trigger.to_state.attributes.dispositivi | default([]) }}"
+                  nuove: "{{ dopo | rejectattr('id', 'in', prima | map(attribute='id') | list) | list }}"
+              - condition: template
+                value_template: "{{ nuove | count > 0 }}"
+              - action: script.zigbee_notifica
+                data:
+                  id_notifica: zigbee_batterie
+                  titolo: "🪫 Zigbee: batteria in esaurimento"
+                  messaggio: >-
+                    {% for d in nuove -%}
+                    🪫 {{ d.nome }}{{ ' (' ~ d.area ~ ')' if d.area != '-' }}:
+                    {{- ' ' ~ (d.batteria | round(0) | int) ~ '%' if d.batteria is not none else ' batteria bassa' }}{{ '\n' if not loop.last }}
+                    {%- endfor %}
+
+          - conditions:
+              - "{{ trigger.id == 'promemoria' }}"
+              - condition: numeric_state
+                entity_id: sensor.zigbee_batterie_basse
+                above: 0
+            sequence:
+              - action: script.zigbee_notifica
+                data:
+                  id_notifica: zigbee_batterie
+                  titolo: "🪫 Zigbee: batterie da sostituire"
+                  messaggio: >-
+                    {% for d in state_attr('sensor.zigbee_batterie_basse', 'dispositivi') or [] -%}
+                    🪫 {{ d.nome }}{{ ' (' ~ d.area ~ ')' if d.area != '-' }}:
+                    {{- ' ' ~ (d.batteria | round(0) | int) ~ '%' if d.batteria is not none else ' batteria bassa' }}{{ '\n' if not loop.last }}
+                    {%- endfor %}

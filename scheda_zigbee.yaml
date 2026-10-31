@@ -1,0 +1,73 @@
+# Scheda "Rete Zigbee" - solo card native, nessuna integrazione HACS richiesta.
+# Dashboard → ✏️ Modifica → + Aggiungi scheda → "Manuale" → incolla tutto.
+type: vertical-stack
+cards:
+  - type: heading
+    heading: Rete Zigbee
+    icon: mdi:zigbee
+
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+      - type: tile
+        entity: sensor.zigbee_dispositivi
+        name: Dispositivi
+      - type: tile
+        entity: sensor.zigbee_dispositivi_offline
+        name: Offline
+        color: red
+      - type: tile
+        entity: sensor.zigbee_batterie_basse
+        name: Batterie basse
+        color: amber
+      - type: tile
+        entity: sensor.zigbee_batteria_minima
+        name: Batteria più bassa
+
+  - type: tile
+    entity: input_number.zigbee_soglia_batteria
+    name: Avvisami sotto il
+    features:
+      - type: numeric-input
+        style: slider
+
+  # Riquadro avvisi: compare solo se c'è qualcosa che non va
+  - type: markdown
+    visibility:
+      - condition: or
+        conditions:
+          - condition: numeric_state
+            entity: sensor.zigbee_dispositivi_offline
+            above: 0
+          - condition: numeric_state
+            entity: sensor.zigbee_batterie_basse
+            above: 0
+    content: |
+      {% set off = state_attr('sensor.zigbee_dispositivi_offline', 'dispositivi') or [] %}
+      {% set bat = state_attr('sensor.zigbee_batterie_basse', 'dispositivi') or [] %}
+      {% if off %}
+      ### 🔴 Non raggiungibili ({{ off | count }})
+      {% for d in off %}
+      - **{{ d.nome }}**{{ ' · ' ~ d.area if d.area != '-' }}
+      {% endfor %}
+      {% endif %}
+      {% if bat %}
+      ### 🪫 Batterie da cambiare ({{ bat | count }})
+      {% for d in bat | sort(attribute='batteria') %}
+      - **{{ d.nome }}**{{ ' · ' ~ d.area if d.area != '-' }} · {{ (d.batteria | round(0) | int ~ '%') if d.batteria is not none else 'bassa' }}
+      {% endfor %}
+      {% endif %}
+
+  # Elenco completo
+  - type: markdown
+    content: |
+      {% set soglia = states('input_number.zigbee_soglia_batteria') | float(20) %}
+      {% set elenco = state_attr('sensor.zigbee_dispositivi', 'elenco') or [] %}
+      | | Dispositivo | Area | Rete | 🔋 | 📶 LQI |
+      |:-:|:--|:--|:-:|--:|--:|
+      {%- for d in elenco | sort(attribute='online') %}
+      | {{ '🟢' if d.online else '🔴' }} | {{ d.nome }} | {{ d.area }} | {{ d.rete }} | {% if d.batteria is not none %}{{ '🪫 ' if d.batteria <= soglia }}{{ d.batteria | round(0) | int }}%{% elif d.batteria_bassa %}🪫 bassa{% elif not d.online %}—{% else %}🔌{% endif %} | {{ d.lqi if d.lqi is not none else '—' }} |
+      {%- endfor %}
+
+      <sub>Aggiornato ogni minuto · 🔌 = alimentato da rete · LQI: più alto è meglio (max 255)</sub>

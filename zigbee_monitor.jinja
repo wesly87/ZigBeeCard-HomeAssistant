@@ -1,0 +1,55 @@
+{#-
+  Zigbee Monitor - macro condivisa
+  Restituisce (in JSON) l'elenco di tutti i dispositivi Zigbee presenti in
+  Home Assistant, sia ZHA sia Zigbee2MQTT, con stato, batteria e LQI.
+-#}
+{%- macro zigbee_report() -%}
+{%- set ns = namespace(ids=[], out=[]) -%}
+
+{#- Dispositivi ZHA -#}
+{%- for e in integration_entities('zha') -%}
+  {%- set d = device_id(e) -%}
+  {%- if d and d not in ns.ids -%}
+    {%- set ns.ids = ns.ids + [d] -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- Dispositivi Zigbee2MQTT (esclude il bridge e gli altri dispositivi MQTT) -#}
+{%- for e in integration_entities('mqtt') -%}
+  {%- set d = device_id(e) -%}
+  {%- if d and d not in ns.ids and 'zigbee2mqtt_0x' in (device_attr(d, 'identifiers') | string) -%}
+    {%- set ns.ids = ns.ids + [d] -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{%- for d in ns.ids -%}
+  {%- set ents = expand(device_entities(d)) -%}
+  {%- if ents | count > 0 -%}
+    {%- set b = namespace(lvl=none, low=false, lqi=none) -%}
+    {%- for s in ents -%}
+      {%- set dc = s.attributes.device_class | default('') -%}
+      {%- if s.domain == 'sensor' and dc == 'battery' and is_number(s.state) -%}
+        {%- set b.lvl = s.state | float -%}
+      {%- elif s.domain == 'binary_sensor' and dc == 'battery' and s.state == 'on' -%}
+        {%- set b.low = true -%}
+      {%- elif s.domain == 'sensor' and (s.entity_id.endswith('_linkquality') or s.entity_id.endswith('_lqi')) and is_number(s.state) -%}
+        {%- set b.lqi = s.state | int -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {#- Un dispositivo e' offline quando TUTTE le sue entita' sono "unavailable" -#}
+    {%- set online = ents | rejectattr('state', 'eq', 'unavailable') | list | count > 0 -%}
+    {%- set ns.out = ns.out + [{
+      'id': d,
+      'nome': device_attr(d, 'name_by_user') or device_attr(d, 'name') or d,
+      'area': area_name(d) or '-',
+      'modello': device_attr(d, 'model') or '',
+      'rete': 'ZHA' if "'zha'" in (device_attr(d, 'identifiers') | string) else 'Z2M',
+      'online': online,
+      'batteria': b.lvl,
+      'batteria_bassa': b.low,
+      'lqi': b.lqi
+    }] -%}
+  {%- endif -%}
+{%- endfor -%}
+{{- ns.out | sort(attribute='nome') | to_json -}}
+{%- endmacro -%}
